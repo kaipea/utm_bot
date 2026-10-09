@@ -7,8 +7,9 @@ from zoneinfo import ZoneInfo
 SGT = ZoneInfo("Asia/Singapore")
 
 # Edit these lists to change the buttons. Values are what lands in the URL.
-SOURCES = ["telegram", "whatsapp", "linkedin", "facebook", "instagram", "x", "reddit", "email"]
-MEDIUMS = ["social", "messaging", "email", "referral", "outreach"]
+SOURCES = ["telegram", "whatsapp", "linkedin", "facebook", "instagram", "x", "reddit", "email",
+           "event", "flyer", "poster"]
+MEDIUMS = ["social", "messaging", "email", "referral", "outreach", "print"]
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
@@ -65,3 +66,15 @@ def build(url: str, source: str, medium: str, campaign: str) -> str:
             if not k.lower().startswith("utm_")]
     kept += [("utm_source", source), ("utm_medium", medium), ("utm_campaign", campaign)]
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(kept), ""))
+
+
+def qr_files(url: str, png_px: int = 1200) -> tuple[bytes, bytes]:
+    """Return (png, svg) bytes for a QR code of url. PNG is roughly png_px wide."""
+    import io
+    import segno
+    qr = segno.make(url, error="m")
+    width = qr.symbol_size(scale=1, border=4)[0]
+    png, svg = io.BytesIO(), io.BytesIO()
+    qr.save(png, kind="png", scale=max(1, png_px // width), border=4)
+    qr.save(svg, kind="svg", scale=10, border=4, xmldecl=False)
+    return png.getvalue(), svg.getvalue()

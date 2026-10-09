@@ -14,7 +14,7 @@ from datetime import datetime
 
 import gspread
 from telegram import (ForceReply, InlineKeyboardButton, InlineKeyboardMarkup,
-                      Update)
+                      InputMediaDocument, Update)
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
@@ -31,7 +31,7 @@ SA_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 FLOW_TTL = 15 * 60  # seconds before an unfinished link request expires
 HEADER = ["timestamp_sgt", "user", "username", "user_id", "original_url",
-          "tagged_url", "utm_source", "utm_medium", "utm_campaign", "source_type"]
+          "tagged_url", "utm_source", "utm_medium", "utm_campaign", "source_type", "qr"]
 
 flows: dict[str, dict] = {}         # flow_id -> state
 other_prompts: dict[int, str] = {}  # prompt message_id -> flow_id
@@ -47,14 +47,33 @@ def _get_sheet():
     if _sheet is None:
         gc = gspread.service_account_from_dict(json.loads(SA_JSON))
         ws = gc.open_by_key(SHEET_ID).sheet1
-        if ws.row_values(1) != HEADER:
+        first = ws.row_values(1)
+        if not first:
             ws.insert_row(HEADER, 1)
+        elif first != HEADER:
+            ws.update([HEADER], "A1")  # e.g. adds the qr column to an older sheet
         _sheet = ws
     return _sheet
 
 
 def _append(row: list) -> None:
     _get_sheet().append_row(row, value_input_option="RAW")
+
+
+def _mark_qr(tagged: str) -> None:
+    ws = _get_sheet()
+    cell = ws.find(tagged, in_column=HEADER.index("tagged_url") + 1)
+    if cell:
+        ws.update_cell(cell.row, HEADER.index("qr") + 1, "yes")
+
+
+async def mark_qr(tagged: str) -> None:
+    if not (SHEET_ID and SA_JSON):
+        return
+    try:
+        await asyncio.to_thread(_mark_qr, tagged)
+    except Exception:
+        log.exception("Couldn't mark QR in sheet")
 
 
 async def log_to_sheet(row: list) -> bool:
@@ -206,7 +225,7 @@ async def finish(q, state: dict, fid: str, medium: str) -> None:
     tagged = utm.build(state["url"], state["source"], medium, campaign)
     ok = await log_to_sheet([now.strftime("%Y-%m-%d %H:%M:%S"), state["user_name"], state["username"],
                              str(state["user_id"]), state["url"], tagged, state["source"], medium,
-                             campaign, "custom" if state["custom"] else "button"])
+                             campaign, "custom" if state["custom"] else "button", ""])
     text = (f"<code>{html.escape(tagged)}</code>\n\n"
             f"source: <b>{html.escape(state['source'])}</b>{' (custom)' if state['custom'] else ''}\n"
             f"medium: <b>{medium}</b>\n"
@@ -214,7 +233,31 @@ async def finish(q, state: dict, fid: str, medium: str) -> None:
             f"made by: {html.escape(state['user_name'])}")
     if not ok:
         text += "\n\n⚠️ Couldn't log this to the sheet. The link still works."
-    await q.edit_message_text(text, parse_mode="HTML", disable_web_page_preview=True)
+    qr_button = InlineKeyboardMarkup([[InlineKeyboardButton("QR code", callback_data="q|0|0")]])
+    await q.edit_message_text(text, parse_mode="HTML", disable_web_page_preview=True,
+                              reply_markup=qr_button)
+
+
+async def on_qr(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Make a QR from the link in the result message itself, so it works even after a restart."""
+    q = update.callback_query
+    lines = (q.message.text or "").splitlines()
+    tagged = lines[0].strip() if lines else ""
+    if not tagged.startswith("https://"):
+        await q.answer("Couldn't read the link from this message.", show_alert=True)
+        return
+    await q.answer("Making QR code…")
+    fields = dict(l.split(": ", 1) for l in lines[1:] if ": " in l)
+    name = utm.normalise(f"{fields.get('campaign', 'link')}-{fields.get('source', '').split(' ')[0]}") or "unpacked-qr"
+    png, svg = await asyncio.to_thread(utm.qr_files, tagged)
+    await ctx.bot.send_media_group(
+        q.message.chat_id,
+        [InputMediaDocument(png, filename=f"{name}.png"),
+         InputMediaDocument(svg, filename=f"{name}.svg",
+                            caption="PNG for screens and flyers, SVG for banners and large print. "
+                                    "Scan to test before printing.")],
+        reply_to_message_id=q.message.message_id)
+    await mark_qr(tagged)
 
 
 def main() -> None:
@@ -225,6 +268,7 @@ def main() -> None:
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("utm", cmd_utm))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^[smx]\|"))
+    app.add_handler(CallbackQueryHandler(on_qr, pattern=r"^q\|"))
     app.add_handler(MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, on_other_reply))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
